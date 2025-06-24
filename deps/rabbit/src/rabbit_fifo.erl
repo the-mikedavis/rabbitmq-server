@@ -15,6 +15,7 @@
 
 -include("rabbit_fifo.hrl").
 -include_lib("rabbit_common/include/rabbit.hrl").
+-include_lib("kernel/include/logger.hrl").
 
 -export([
          %% ra_machine callbacks
@@ -265,6 +266,7 @@ apply(#{index := Idx} = Meta,
             State0 = add_bytes_return(Header, State00),
             Con = Con0#consumer{checked_out = maps:remove(MsgId, Checked0),
                                 credit = increase_credit(Meta, Con0, 1)},
+            ?LOG_INFO("[requeue] deleting index ~p (exists?: ~p)", [OldIdx, rabbit_fifo_index:exists(OldIdx, Indexes0)]),
             State1 = State0#?MODULE{ra_indexes = rabbit_fifo_index:delete(OldIdx, Indexes0),
                                     messages = lqueue:in(?MSG(Idx, Header), Messages),
                                     enqueue_count = EnqCount + 1},
@@ -459,6 +461,8 @@ apply(#{system_time := Ts, machine_version := MachineVersion} = Meta,
     %% if the pid refers to an active or cancelled consumer,
     %% mark it as suspected and return it to the waiting queue
     {State1, Effects0} =
+        %% SAFETY: UNSAFE. This can cause a shuffle of messages in returns.
+        %% Maybe this is fine though because it's only for SAC.
         maps:fold(fun({_, P} = Cid, C0, {S0, E0})
                         when node(P) =:= Node ->
                           %% the consumer should be returned to waiting
@@ -518,6 +522,7 @@ apply(#{system_time := Ts, machine_version := MachineVersion} = Meta,
     Node = node(Pid),
 
     {State, Effects1} =
+        %% SAFETY: UNSAFE.
         maps:fold(
           fun({_, P} = Cid, #consumer{checked_out = Checked0,
                                       status = up} = C0,
@@ -782,11 +787,27 @@ handle_down(Meta, Pid, #?MODULE{consumers = Cons0,
     {Effects1, State2} = handle_waiting_consumer_down(Pid, State1),
     % return checked out messages to main queue
     % Find the consumers for the down pid
+    %% SAFETY: UNSAFE. A down channel shuffles returns of its consumers.
     DownConsumers = maps:keys(
                       maps:filter(fun({_, P}, _) -> P =:= Pid end, Cons0)),
-    lists:foldl(fun(ConsumerId, {S, E}) ->
+    ?LOG_WARNING("Handling down of ~b consumers from ~p (sorted? ~p)", [length(DownConsumers), Pid, lists:sort(DownConsumers) == DownConsumers]),
+    ?LOG_WARNING("Shuffling!"),
+    DownConsumers1 = [X || {_, X} <- lists:sort([{rand:uniform(), N} || N <- DownConsumers])],
+    log_returns(DownConsumers1, State1),
+    %% Each of these consumers has one message checked out.
+    {S123, E123} = lists:foldl(fun(ConsumerId, {S, E}) ->
                         cancel_consumer(Meta, ConsumerId, S, E, down)
-                end, {State2, Effects1}, DownConsumers).
+                end, {State2, Effects1}, DownConsumers1),
+    {S123, E123}.
+
+log_returns(ConsumerIds, #?MODULE{consumers = Consumers}) ->
+    Returns = [begin
+        Cons = maps:get(ConsumerId, Consumers),
+        [?MSG(Idx, _)] = maps:values(Cons#consumer.checked_out),
+        Idx
+    end || ConsumerId <- ConsumerIds],
+    ?LOG_INFO("Returning ~w", [Returns]),
+    ok.
 
 consumer_active_flag_update_function(
   #?MODULE{cfg = #cfg{consumer_strategy = competing}}) ->
@@ -874,6 +895,7 @@ state_enter0(eol, #?MODULE{enqueuers = Enqs,
                            consumers = Custs0,
                            waiting_consumers = WaitingConsumers0},
              Effects) ->
+    %% SAFETY: Ordering of eol events sent to consumers is not important.
     Custs = maps:fold(fun({_, P}, V, S) -> S#{P => V} end, #{}, Custs0),
     WaitingConsumers1 = lists:foldl(fun({{_, P}, V}, Acc) -> Acc#{P => V} end,
                                     #{}, WaitingConsumers0),
@@ -1010,6 +1032,7 @@ handle_aux(_RaftState, cast, {#return{msg_ids = MsgIds,
                                 consumers = Consumers}) ->
     case Consumers of
         #{ConsumerId := #consumer{checked_out = Checked}} ->
+            %% SAFETY: accumulated list is sorted below.
             {Log, ToReturn} =
                 maps:fold(
                   fun (MsgId, ?MSG(Idx, Header), {L0, Acc}) ->
@@ -1048,6 +1071,7 @@ handle_aux(_, _, {get_checked_out, ConsumerId, MsgIds},
                                 consumers = Consumers}) ->
     case Consumers of
         #{ConsumerId := #consumer{checked_out = Checked}} ->
+            %% SAFETY: message ordering doesn't matter here.
             {Log, IdMsgs} =
                 maps:fold(
                   fun (MsgId, ?MSG(Idx, Header), {L0, Acc}) ->
@@ -1186,6 +1210,7 @@ query_messages_ready(State) ->
     messages_ready(State).
 
 query_messages_checked_out(#?MODULE{consumers = Consumers}) ->
+    %% SAFETY: addition is commutative so ordering doesn't matter
     maps:fold(fun (_, #consumer{checked_out = C}, S) ->
                       maps:size(C) + S
               end, 0, Consumers).
@@ -1194,6 +1219,7 @@ query_messages_total(State) ->
     messages_total(State).
 
 query_processes(#?MODULE{enqueuers = Enqs, consumers = Cons0}) ->
+    %% NOTE: only used in tests
     Cons = maps:fold(fun({_, P}, V, S) -> S#{P => V} end, #{}, Cons0),
     maps:keys(maps:merge(Enqs, Cons)).
 
@@ -1206,6 +1232,7 @@ query_waiting_consumers(#?MODULE{waiting_consumers = WaitingConsumers}) ->
 
 query_consumer_count(#?MODULE{consumers = Consumers,
                               waiting_consumers = WaitingConsumers}) ->
+    %% SAFETY: addition is commutative
     Up = maps:filter(fun(_ConsumerId, #consumer{status = Status}) ->
                              Status =/= suspected_down
                      end, Consumers),
@@ -1237,6 +1264,7 @@ query_consumers(#?MODULE{consumers = Consumers,
                         end
                 end
         end,
+    %% SAFETY: output is stored as a map.
     FromConsumers =
         maps:fold(fun (_, #consumer{status = cancelled}, Acc) ->
                           Acc;
@@ -1309,6 +1337,7 @@ query_peek(Pos, State0) when Pos > 0 ->
     end.
 
 query_notify_decorators_info(#?MODULE{consumers = Consumers} = State) ->
+    %% SAFETY: MAX is commutative
     MaxActivePriority = maps:fold(
                           fun(_, #consumer{credit = C,
                                            status = up,
@@ -1374,6 +1403,7 @@ moving_average(Time, HalfLife, Next, Current) ->
     Next * (1 - Weight) + Current * Weight.
 
 num_checked_out(#?MODULE{consumers = Cons}) ->
+    %% SAFETY: addition is commutative
     maps:fold(fun (_, #consumer{checked_out = C}, Acc) ->
                       maps:size(C) + Acc
               end, 0, Cons).
@@ -1490,6 +1520,7 @@ active_consumer({_Cid, #consumer{status = _}, I}) ->
 active_consumer(none) ->
     undefined;
 active_consumer(M) when is_map(M) ->
+    %% SAFETY: There can be only one SAC, so this is fine.
     I = maps:iterator(M),
     active_consumer(maps:next(I)).
 
@@ -1663,6 +1694,8 @@ maybe_enqueue(RaftIdx, Ts, From, MsgSeqNo, RawMsg, Effects0,
 
 return(#{index := IncomingRaftIdx, machine_version := MachineVersion} = Meta,
        ConsumerId, Returned, Effects0, State0) ->
+    %% SAFETY: UNSAFE. If `Returned` has more than 32 elements this causes
+    %% unordered messages to end up in the returns.
     {State1, Effects1} = maps:fold(
                            fun(MsgId, Msg, {S0, E0}) ->
                                    return_one(Meta, MsgId, Msg, S0, E0, ConsumerId)
@@ -1880,6 +1913,7 @@ return_one(#{machine_version := MachineVersion} = Meta,
 return_all(Meta, #?MODULE{consumers = Cons} = State0, Effects0, ConsumerId,
            #consumer{checked_out = Checked} = Con) ->
     State = State0#?MODULE{consumers = Cons#{ConsumerId => Con}},
+    %% hmm... interestingly this one is sorted...
     lists:foldl(fun ({MsgId, Msg}, {S, E}) ->
                         return_one(Meta, MsgId, Msg, S, E, ConsumerId)
                 end, {State, Effects0}, lists:sort(maps:to_list(Checked))).
@@ -1955,6 +1989,7 @@ evaluate_limit(Index, Result, BeforeState,
                 {false, true} ->
                     %% we have moved below the lower limit
                     {Enqs, Effects} =
+                        %% SAFETY: I think this is fine...
                         maps:fold(
                           fun (P, #enqueuer{} = E0, {Enqs, Acc})  ->
                                   E = E0#enqueuer{blocked = undefined},
@@ -2068,7 +2103,7 @@ checkout_one(#{system_time := Ts} = Meta, ExpiredMsg0, InitState0, Effects0) ->
         {{value, ConsumerId}, SQ1}
           when is_map_key(ConsumerId, Cons0) ->
             case take_next_msg(InitState) of
-                {ConsumerMsg, State0} ->
+                {?MSG(Idx, _) = ConsumerMsg, State0} ->
                     %% there are consumers waiting to be serviced
                     %% process consumer checkout
                     case maps:get(ConsumerId, Cons0) of
@@ -2088,6 +2123,7 @@ checkout_one(#{system_time := Ts} = Meta, ExpiredMsg0, InitState0, Effects0) ->
                                   next_msg_id = Next,
                                   credit = Credit,
                                   delivery_count = DelCnt} = Con0 ->
+                            ?LOG_INFO("Checking out ~w to ~p as ~w", [Idx, ConsumerId, Next]),
                             Checked = maps:put(Next, ConsumerMsg, Checked0),
                             Con = Con0#consumer{checked_out = Checked,
                                                 next_msg_id = Next + 1,
