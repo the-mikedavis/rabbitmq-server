@@ -726,9 +726,12 @@ handle_down(Meta, Pid, #?STATE{consumers = Cons0,
     DownConsumers = maps:keys(maps:filter(fun(_CKey, ?CONSUMER_PID(P)) ->
                                                   P =:= Pid
                                           end, Cons0)),
+    %% Shuffle the map keys to simulate the keys having different orderings
+    %% among cluster members.
+    DownConsumers1 = [X || {_, X} <- lists:sort([{rand:uniform(), N} || N <- DownConsumers])],
     lists:foldl(fun(ConsumerKey, {S, E}) ->
                         cancel_consumer(Meta, ConsumerKey, S, E, down)
-                end, {State2, Effects1}, DownConsumers).
+                end, {State2, Effects1}, DownConsumers1).
 
 consumer_active_flag_update_function(
   #?STATE{cfg = #cfg{consumer_strategy = competing}}) ->
